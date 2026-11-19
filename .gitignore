@@ -1,10 +1,17 @@
 
+# Gradle 및 Android Studio 캐시
 .gradle/
 .idea/
 .kotlin/
+
+# 빌드 결과물
 */build/
-local.properties
-*.iml
 *.apk
 *.aab
+
+# 로컬 개발환경 설정
+local.properties
+*.iml
+
+# Samsung Health Sensor SDK
 wear/libs/*.aar

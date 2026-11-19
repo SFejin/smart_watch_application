@@ -7,6 +7,9 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.*
 import android.util.Log
+import com.example.workersafety.link.WatchLinkProtocol
+import java.util.UUID
+import com.google.android.gms.wearable.PutDataRequest
 import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
 import com.samsung.android.service.health.tracking.ConnectionListener
@@ -36,7 +39,9 @@ class SensorService : Service() {
     private var skinTracker: HealthTracker? = null
     private var intervalMinutes = 5
     private var running = false
-    private var window = MeasurementWindow(System.currentTimeMillis())
+    private var publishing = false
+    private var pendingRequest: Pair<String, PutDataRequest>? = null
+    @Volatile private var window = MeasurementWindow(System.currentTimeMillis())
 
     private val connectionListener = object : ConnectionListener {
         override fun onConnectionSuccess() {
@@ -115,7 +120,10 @@ class SensorService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_SEND_NOW -> if (running) sendSummary() else updateStatus("먼저 측정을 시작하세요")
+            ACTION_SEND_NOW -> if (running) sendSummary() else {
+                updateStatus("먼저 측정을 시작하세요")
+                stopSelf()
+            }
             ACTION_START -> {
                 if (running) return START_NOT_STICKY
                 if (checkSelfPermission(Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) {
@@ -142,6 +150,9 @@ class SensorService : Service() {
                     return START_NOT_STICKY
                 }
                 running = true
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove("live_hr").remove("live_skin")
+                    .remove("pending_summary_id").remove("receipt_result")
+                    .putString("delivery", "새 측정 수집 중 · 전송 대기").apply()
                 window = MeasurementWindow(System.currentTimeMillis())
                 updateStatus("Health Sensor 연결 중...")
                 service = HealthTrackingService(connectionListener, applicationContext)
@@ -153,9 +164,17 @@ class SensorService : Service() {
     }
 
     private fun sendSummary() {
+        if (publishing) return
+        pendingRequest?.let { (id, request) ->
+            publish(id, request)
+            return
+        }
         val summary = window.closeWindow(System.currentTimeMillis(), intervalMinutes)
         val req = PutDataMapRequest.create(PATH)
         val map = req.dataMap
+        val summaryId = UUID.randomUUID().toString()
+        map.putString(WatchLinkProtocol.SUMMARY_ID, summaryId)
+        PhoneLinkStore.begin(this, summaryId)
         map.putLong("window_start", summary.windowStartMs)
         map.putLong("timestamp", summary.windowEndMs)
         map.putInt("interval_minutes", summary.intervalMinutes)
@@ -169,16 +188,29 @@ class SensorService : Service() {
         map.putInt("skin_count", summary.temperatureCount)
         // timestamp changes every summary, ensuring each summary updates the same item.
         val request = req.asPutDataRequest().setUrgent()
+        pendingRequest = summaryId to request
+        publish(summaryId, request)
+    }
+
+    /** Retain a failed local write for the next manual/periodic attempt during this service. */
+    private fun publish(summaryId: String, request: PutDataRequest) {
+        publishing = true
         try {
             Wearable.getDataClient(this).putDataItem(request)
-                .addOnSuccessListener { updateStatus("전송 요청 성공: ${summary.heartRateCount} HR / ${summary.temperatureCount} 피부온도") }
+                .addOnSuccessListener {
+                    publishing = false
+                    if (pendingRequest?.first == summaryId) pendingRequest = null
+                    PhoneLinkStore.queued(this, summaryId, "전송 등록됨 · 휴대폰 수신 대기")
+                }
                 .addOnFailureListener {
+                    publishing = false
                     Log.e(TAG, "Data Layer write failed", it)
-                    updateStatus("전송 요청 실패: 연결 확인")
+                    PhoneLinkStore.queued(this, summaryId, "전송 실패 · 연결 확인 후 다시 전송하세요")
                 }
         } catch (ex: Exception) {
+            publishing = false
             Log.e(TAG, "Google Play services unavailable", ex)
-            updateStatus("Data Layer 사용 불가")
+            PhoneLinkStore.queued(this, summaryId, "Data Layer 사용 불가 · Google Play 서비스 확인")
         }
     }
 
@@ -197,12 +229,13 @@ class SensorService : Service() {
     }
 
     override fun onDestroy() {
+        val wasRunning = running
         running = false
         handler.removeCallbacks(ticker)
         try { heartTracker?.unsetEventListener() } catch (_: Exception) {}
         try { skinTracker?.unsetEventListener() } catch (_: Exception) {}
         try { service?.disconnectService() } catch (_: Exception) {}
-        updateStatus("측정 종료")
+        if (wasRunning) updateStatus("측정 종료")
         super.onDestroy()
     }
 }
