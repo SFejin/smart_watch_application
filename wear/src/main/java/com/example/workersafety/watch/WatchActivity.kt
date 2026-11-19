@@ -14,17 +14,19 @@ import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
+import com.example.workersafety.link.WatchLinkProtocol
+import com.google.android.gms.wearable.CapabilityClient
+import com.google.android.gms.wearable.Wearable
 
-/**
- * 화면 전환을 복구한 워치 Activity.
- * 기존 SensorService의 5분/10분 측정 및 데이터 전송 코드는 변경하지 않는다.
- */
+/** Sensor pages and an accessible phone connection / delivery page. */
 class WatchActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
-    private var currentPage = 0 // 0: 시작, 1: 심박수, 2: 피부온도
+    private var currentPage = 0 // 0: 시작, 1: 심박수, 2: 피부온도, 3: 연결
+    private var checkingPhone = false
+    private var lastPhoneCheck = 0L
 
     private fun showPage(page: Int) {
-        if (page !in 0..2) return
+        if (page !in 0..3) return
         currentPage = page
         findViewById<View>(R.id.pageStart).visibility =
             if (page == 0) View.VISIBLE else View.GONE
@@ -32,8 +34,8 @@ class WatchActivity : Activity() {
             if (page == 1) View.VISIBLE else View.GONE
         findViewById<View>(R.id.pageSkin).visibility =
             if (page == 2) View.VISIBLE else View.GONE
-        // 송신 오류 화면은 평상시에 노출하지 않는다. 오류 이벤트 기능은 추후 연결한다.
-        findViewById<View>(R.id.pageStatus).visibility = View.GONE
+        findViewById<View>(R.id.pageStatus).visibility = if (page == 3) View.VISIBLE else View.GONE
+        if (page == 3) refreshPhoneConnection()
     }
 
     private val refresh = object : Runnable {
@@ -53,6 +55,10 @@ class WatchActivity : Activity() {
                 text = prefs.getString("status", "대기 중") ?: "대기 중"
                 visibility = View.GONE
             }
+            findViewById<TextView>(R.id.txtConnection).text = prefs.getString("phone_connection", "휴대폰 연결 확인 중")
+            findViewById<TextView>(R.id.txtTransmission).text = prefs.getString("delivery", "전송 기록 없음")
+            findViewById<TextView>(R.id.txtSensorStatus).text = prefs.getString("status", "측정을 시작하세요")
+            if (android.os.SystemClock.elapsedRealtime() - lastPhoneCheck >= 15_000L) refreshPhoneConnection()
             handler.postDelayed(this, 1500L)
         }
     }
@@ -65,7 +71,10 @@ class WatchActivity : Activity() {
         findViewById<Button>(R.id.navHeart).setOnClickListener { showPage(1) }
         findViewById<Button>(R.id.navSkin).setOnClickListener { showPage(2) }
 
-        // XML에 있는 송신 오류 화면용 수동 전송 버튼의 기존 동작 유지
+        findViewById<Button>(R.id.navStatus).setOnClickListener { showPage(3) }
+        findViewById<Button>(R.id.btnStatusBack).setOnClickListener { showPage(0) }
+
+        // Manual send is reachable from the connection page.
         findViewById<Button>(R.id.btnSend).setOnClickListener {
             startService(
                 Intent(this, SensorService::class.java)
@@ -76,7 +85,39 @@ class WatchActivity : Activity() {
             stopService(Intent(this, SensorService::class.java))
             showPage(0)
         }
-        showPage(0)
+        showPage(savedInstanceState?.getInt("page") ?: 0)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt("page", currentPage)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun refreshPhoneConnection() {
+        if (checkingPhone) return
+        checkingPhone = true
+        lastPhoneCheck = android.os.SystemClock.elapsedRealtime()
+        fun status(message: String) {
+            getSharedPreferences(SensorService.PREFS, MODE_PRIVATE).edit()
+                .putString("phone_connection", message).apply()
+            checkingPhone = false
+        }
+        try {
+            Wearable.getCapabilityClient(this).getCapability(
+                WatchLinkProtocol.PHONE_CAPABILITY, CapabilityClient.FILTER_REACHABLE)
+                .addOnSuccessListener { info ->
+                    val phone = info.nodes.singleOrNull()
+                    status(when {
+                        info.nodes.isEmpty() -> "휴대폰 미연결 · 앱 설치/페어링 확인"
+                        phone == null -> "휴대폰 여러 대 · 한 대만 연결하세요"
+                        phone.isNearby -> "휴대폰 연결됨 · 가까운 기기"
+                        else -> "휴대폰 연결됨 · 원격 경로"
+                    })
+                }
+                .addOnFailureListener { status("연결 확인 실패 · Google Play 서비스 확인") }
+        } catch (_: Exception) {
+            status("연결 확인 실패 · Google Play 서비스 확인")
+        }
     }
 
     private fun requestAndStart() {
@@ -132,6 +173,7 @@ class WatchActivity : Activity() {
         super.onResume()
         handler.removeCallbacks(refresh)
         handler.post(refresh)
+        refreshPhoneConnection()
     }
 
     override fun onPause() {
